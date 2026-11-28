@@ -107,34 +107,40 @@ let
         pkgs,
         ...
       }:
-      ((if lib.typeOf module == "path" then import module else module) (
-        {
-          inherit
-            lib
-            config
-            options
-            pkgs
-            ;
-          l = l // {
-            # ugly, dont know another way to do this
+      (
+        (
+          if lib.typeOf module == "path" then
+            import module
+          else if lib.typeOf module == "string" then
+            import module
+          else
+            module
+        )
+        (
+          {
             inherit
-              sources
-              fetchGhFile
-              mkBoolOption
-              mkDeprecatedOption
-              mkDeprecatedOptionModule
-              importModule
-              importCategoryModule
-              mkCategoryModules
-              mkCategoryOptions
-              mkCategoryConfig
-              mkCategoryImports
-              mkFilesystemOptions
+              lib
+              config
+              options
+              pkgs
               ;
-          };
-        }
-        // extraArgs
-      ))
+            l = l // {
+              # ugly, dont know another way to do this
+              inherit
+                sources
+                fetchGhFile
+                mkBoolOption
+                mkDeprecatedOption
+                mkDeprecatedOptionModule
+                importModule
+                mkCategoryModules
+                mkFilesystemOptions
+                ;
+            };
+          }
+          // extraArgs
+        )
+      )
     );
 
   # Converts a declarative attrset of filesystem options into a valid list.
@@ -155,60 +161,64 @@ let
     in
     l.mkIf (finalOptions != [ ]) finalOptions;
 
-  # import a module using `importModule` and adds the args `parentCfg` and `cfg` to the module
-  # `categoryConfig` is the config for the category the module belongs to, ex: config.nix-mineral.settings.kernel
-  # `path` is the path to the module, ex: ./a-kernel-module.nix
+  # recursively import a entire category of modules from a path, and return a list of modules to be imported with `imports`
+  # `config` has to be the config attribute from nixpkgs
+  # `path` is the path to the folder containing the modules, ex: ./category-name
+  # `ignore` is a list of paths to ignore (can also be a folder), ex: [ ./category-name/module-name.nix ]
   # `args` are the default arguments to pass to the module, needs to be: { inherit options config pkgs lib; }
-  # ---
-  # `parentCfg` is just the `categoryConfig` passed to the module
-  # `cfg` is the child of parentCfg that has the base name of the path (without the .nix extension if any)
-  importCategoryModule =
-    categoryConfig: path: args:
-    (importModule path {
-      # pass the category config to the module
-      parentCfg = categoryConfig;
-      # pass the path base name as a config attribute
-      # remove .nix extension if present
-      cfg = categoryConfig.${l.removeSuffix ".nix" (l.baseNameOf path)};
-    })
-      args;
-
-  # import many modules with `importCategoryModule` and creates a list with the results
-  # `categoryConfig` is the config for the category the module belongs to, ex: config.nix-mineral.settings.kernel
-  # `paths` is a list of paths to the modules, ex: [ ./a-kernel-module.nix ./another-kernel-module.nix ]
-  # `args` are the default arguments to pass to the module, needs to be: { inherit options config pkgs lib; }
+  # `extraParents` is a list of strings to add to the module option path, ex: [ "nix-mineral" ] will make the module options be available at config.nix-mineral.category-name.option-name
+  # `condition` a default condition to apply to all modules
   mkCategoryModules =
-    categoryConfig: paths: args:
-    l.map (path: (importCategoryModule categoryConfig path args)) paths;
-
-  # create an attrset with all options from a list of categoryModules created with `mkCategoryModules`
-  mkCategoryOptions =
-    modules:
-    l.mergeAttrsList (l.map (module: if module ? options then module.options else { }) modules);
-
-  # create a config for a list of categoryModules created with `mkCategoryModules`
-  # use this to define a `config = ...` attrset
-  mkCategoryConfig =
-    modules: (l.mkMerge (l.map (module: if module ? config then module.config else { }) modules));
-
-  # create a list of imports for a list of categoryModules created with `mkCategoryModules
-  # this uses `importModule` to import the modules, so it will pass the `l` variable to every module
-  # use this to define an `imports = ...` attrset
-  mkCategoryImports =
-    modules:
-    l.concatMap (
-      module:
-      if module ? imports then
-        (l.map (
-          moduleImport:
-          if l.typeOf moduleImport == "path" || l.typeOf moduleImport == "lambda" then
-            importModule moduleImport { }
-          else
-            moduleImport
-        ) module.imports)
-      else
-        [ ]
-    ) modules;
+    {
+      config,
+      path,
+      ignore ? [ ],
+      args,
+      extraParents ? [ "nix-mineral" ],
+      condition ? config.nix-mineral.enable,
+    }:
+    let
+      # get all .nix files inside the path ignoring the files in the ignore list
+      rawFilesetModules = l.map (l.fileset.fileFilter (file: file.hasExt "nix")) (
+        l.fileset.toList (l.fileset.difference (l.fileset.unions [ path ]) (l.fileset.unions ignore))
+      );
+      # there is no default way to convert unions to strings or paths, so this is a workaround
+      # `getModuleAttrPath` returns the attribute path of the module, ex: [ "extra-parent" "category-name" "module-name" ]
+      # `getModuleFilePath` returns the module file path from nix store
+      getModuleAttrPath =
+        fileset:
+        extraParents
+        ++ (l.drop 3 fileset._internalBaseComponents)
+        ++ [
+          (l.removeSuffix ".nix" (l.elemAt (l.attrNames fileset._internalTree) 0))
+        ];
+      getModuleFilePath =
+        fileset: (toString fileset._internalBase) + "/" + (l.elemAt (l.attrNames fileset._internalTree) 0);
+    in
+    l.map (
+      fileset:
+      (
+        let
+          moduleAttrPath = getModuleAttrPath fileset;
+          moduleAttrPathParent = l.dropEnd 1 moduleAttrPath;
+          importedModule =
+            (importModule (getModuleFilePath fileset) {
+              parentCfg = l.getAttrFromPath moduleAttrPathParent config;
+              cfg = l.getAttrFromPath moduleAttrPath config;
+            })
+              args;
+        in
+        l.optionalAttrs (importedModule ? imports) {
+          inherit (importedModule) imports;
+        }
+        // l.optionalAttrs (importedModule ? options) {
+          options = l.setAttrByPath moduleAttrPathParent importedModule.options;
+        }
+        // l.optionalAttrs (importedModule ? config) {
+          config = l.mkIf condition importedModule.config;
+        }
+      )
+    ) rawFilesetModules;
 in
 {
   flake.lib = {
@@ -219,11 +229,7 @@ in
       mkDeprecatedOption
       mkDeprecatedOptionModule
       importModule
-      importCategoryModule
       mkCategoryModules
-      mkCategoryOptions
-      mkCategoryConfig
-      mkCategoryImports
       ;
   };
 }
